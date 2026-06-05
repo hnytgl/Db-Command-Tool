@@ -22,27 +22,12 @@ import getpass
 import json
 import os
 import platform
-import re
 import shlex
 import subprocess
 import sys
 from dataclasses import dataclass
 from typing import Any, List, Optional, Sequence, Tuple
 
-
-READONLY_KEYWORDS = {
-    "SELECT",
-    "SHOW",
-    "DESC",
-    "DESCRIBE",
-    "EXPLAIN",
-    "WITH",
-}
-
-SESSION_KEYWORDS = {
-    "USE",
-    "SET",
-}
 
 SAFE_LOCAL_COMMANDS = {
     "hostname",
@@ -113,28 +98,6 @@ def normalize_type(db_type: str) -> str:
     if value not in aliases:
         raise ValueError(f"不支持的数据库类型：{db_type}")
     return aliases[value]
-
-
-def first_sql_keyword(sql: str) -> str:
-    text = sql.strip()
-    while True:
-        if text.startswith("--"):
-            idx = text.find("\n")
-            text = "" if idx == -1 else text[idx + 1 :].lstrip()
-            continue
-        if text.startswith("/*"):
-            idx = text.find("*/")
-            text = "" if idx == -1 else text[idx + 2 :].lstrip()
-            continue
-        break
-
-    match = re.match(r"([A-Za-z_]+)", text)
-    return match.group(1).upper() if match else ""
-
-
-def is_safe_without_write_flag(sql: str) -> bool:
-    keyword = first_sql_keyword(sql)
-    return keyword in READONLY_KEYWORDS or keyword in SESSION_KEYWORDS
 
 
 def split_sql_statements(sql_text: str) -> List[str]:
@@ -317,23 +280,7 @@ def connect(args: argparse.Namespace) -> Any:
     raise ValueError(f"不支持的数据库类型：{args.type}")
 
 
-def confirm_statement(statement: str) -> bool:
-    print("\n检测到非只读 SQL：")
-    print("-" * 80)
-    print(statement[:1200] + ("..." if len(statement) > 1200 else ""))
-    print("-" * 80)
-    answer = input("确认执行？输入 yes 继续，其它任意输入取消：").strip().lower()
-    return answer == "yes"
-
-
 def execute_statement(conn: Any, statement: str, args: argparse.Namespace) -> QueryResult:
-    if not is_safe_without_write_flag(statement):
-        if not args.allow_write:
-            raise PermissionError("检测到非只读 SQL。为避免误操作，请增加 --allow-write 后再执行。")
-        if not args.yes and sys.stdin.isatty():
-            if not confirm_statement(statement):
-                raise KeyboardInterrupt("用户取消执行。")
-
     cursor = conn.cursor()
     try:
         cursor.execute(statement)
@@ -478,7 +425,7 @@ def run_interactive(args: argparse.Namespace) -> None:
             if not buffer and command in {".exit", ".quit", "exit", "quit"}:
                 break
             if not buffer and command == ".help":
-                print("常用命令：\n  .help          显示帮助\n  .exit/.quit    退出\n  SQL;           以分号结尾执行 SQL\n说明：非只读 SQL 需启动时增加 --allow-write。")
+                print("常用命令：\n  .help          显示帮助\n  .exit/.quit    退出\n  SQL;           以分号结尾执行 SQL\n说明：本工具不拦截 UPDATE、DELETE、INSERT、DROP 等 SQL，执行时请注意确认。")
                 continue
 
             buffer.append(line)
@@ -754,7 +701,127 @@ NAME '{java_name}.exec(java.lang.String) return java.lang.String';
             pass
 
 
+def _exec_remote_cmd(conn: Any, db_type: str, command: str, args: argparse.Namespace) -> RemoteCmdResult:
+    """按数据库类型分发远程命令执行。"""
+    if db_type == "mssql":
+        return _exec_remote_cmd_mssql(conn, command)
+    elif db_type == "mysql":
+        return _exec_remote_cmd_mysql(conn, command)
+    elif db_type == "oracle":
+        return _exec_remote_cmd_oracle(conn, command)
+    else:
+        raise ValueError(f"不支持的数据库类型：{db_type}")
+
+
 def run_remote_cmd(args: argparse.Namespace) -> None:
+    """连接数据库并在数据库服务器上执行一条系统命令。"""
+    if not args.remote_cmd:
+        raise ValueError("请指定 --remote-cmd 要执行的命令，或加 -i 进入交互模式。")
+
+    db_type = normalize_type(args.type)
+    print(f"正在连接 {db_type} 服务器 {args.host or args.dsn} ...")
+    conn = connect(args)
+
+    try:
+        # MSSQL：可选启用 xp_cmdshell
+        if db_type == "mssql" and args.enable_xp_cmdshell:
+            _enable_xp_cmdshell_mssql(conn)
+
+        result = _exec_remote_cmd(conn, db_type, args.remote_cmd, args)
+
+        # 输出结果
+        print(f"\n远程命令：{result.command}")
+        print(f"{'=' * 60}")
+        if result.output:
+            print(result.output)
+        else:
+            print("（命令无输出）")
+        if result.error:
+            print(f"[错误] {result.error}")
+
+        # JSON / 保存处理
+        if args.output == "json":
+            text = json.dumps(result.__dict__, ensure_ascii=False, indent=2)
+            if args.save:
+                with open(args.save, "w", encoding="utf-8") as f:
+                    f.write(text)
+                print(f"\n结果已保存：{args.save}")
+            else:
+                print(text)
+
+        elif args.save:
+            with open(args.save, "w", encoding="utf-8") as f:
+                f.write(result.output)
+                if result.error:
+                    f.write(f"\n[error]\n{result.error}")
+            print(f"\n结果已保存：{args.save}")
+
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def run_remote_cmd_interactive(args: argparse.Namespace) -> None:
+    """连接数据库并进入远程命令交互模式，每行输入在数据库服务器上执行。"""
+    db_type = normalize_type(args.type)
+    print(f"正在连接 {db_type} 服务器 {args.host or args.dsn} ...")
+    conn = connect(args)
+
+    # MSSQL：可选启用 xp_cmdshell
+    if db_type == "mssql" and args.enable_xp_cmdshell:
+        try:
+            _enable_xp_cmdshell_mssql(conn)
+        except Exception as exc:
+            eprint(f"警告：启用 xp_cmdshell 失败：{exc}")
+
+    print(f"\n已进入远程命令交互模式（{db_type}@{args.host or args.dsn}）")
+    print("每行输入一个系统命令，在数据库服务器上执行。")
+    print("输入 .exit 退出；输入 .help 查看帮助。\n")
+
+    try:
+        while True:
+            try:
+                line = input("remote> ")
+            except EOFError:
+                print()
+                break
+
+            command = line.strip()
+            if not command:
+                continue
+
+            if command in {".exit", ".quit", "exit", "quit"}:
+                break
+
+            if command == ".help":
+                print("帮助：\n"
+                      "  .exit / .quit   退出交互模式\n"
+                      "  .help            显示本帮助\n"
+                      "  其他输入         在数据库服务器上执行系统命令\n"
+                      "\n"
+                      "示例：\n"
+                      "  remote> whoami\n"
+                      "  remote> ipconfig /all\n"
+                      "  remote> ls -la /tmp\n"
+                      "  remote> .exit")
+                continue
+
+            # 执行命令
+            try:
+                result = _exec_remote_cmd(conn, db_type, command, args)
+                if result.output:
+                    print(result.output)
+                if result.error:
+                    print(f"[错误] {result.error}")
+            except Exception as exc:
+                eprint(f"执行失败：{exc}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
     """连接数据库并在数据库服务器上执行系统命令。"""
     if not args.remote_cmd:
         raise ValueError("请指定 --remote-cmd 要执行的命令。")
@@ -815,7 +882,7 @@ def run_remote_cmd(args: argparse.Namespace) -> None:
 def validate_args(args: argparse.Namespace) -> None:
     if args.list_local_commands or args.local_cmd:
         return
-    if args.remote_cmd:
+    if args.remote_cmd is not None:
         if not args.type:
             raise ValueError("远程命令模式必须指定 --type 数据库类型。")
         if not args.user:
@@ -852,14 +919,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--save", help="将 json/csv/命令输出保存到文件")
     parser.add_argument("--timeout", type=int, default=10, help="数据库连接和读写超时时间，秒")
     parser.add_argument("--autocommit", action="store_true", help="启用自动提交")
-    parser.add_argument("--allow-write", action="store_true", help="允许执行非只读 SQL")
-    parser.add_argument("--yes", action="store_true", help="非只读 SQL 不再二次确认")
 
     parser.add_argument("--local-cmd", help="执行本机安全诊断命令，不连接数据库")
     parser.add_argument("--local-timeout", type=int, default=15, help="本机命令超时时间，秒")
     parser.add_argument("--list-local-commands", action="store_true", help="列出允许执行的本机诊断命令")
 
-    parser.add_argument("--remote-cmd", help="在数据库服务器上执行系统命令（通过数据库自身机制，如 xp_cmdshell）")
+    parser.add_argument("--remote-cmd", nargs="?", const="", default=None, help="在数据库服务器上执行系统命令。不加命令值时配合 -i 进入交互模式。")
     parser.add_argument("--enable-xp-cmdshell", action="store_true", help="MSSQL：自动启用 xp_cmdshell（需系统管理员权限）")
 
     parser.add_argument("--charset", default="utf8mb4", help="MySQL 字符集")
@@ -882,7 +947,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             list_safe_local_commands()
         elif args.local_cmd:
             run_local_command(args)
-        elif args.remote_cmd:
+        elif args.remote_cmd is not None and args.interactive:
+            run_remote_cmd_interactive(args)
+        elif args.remote_cmd is not None:
             run_remote_cmd(args)
         elif args.interactive:
             run_interactive(args)

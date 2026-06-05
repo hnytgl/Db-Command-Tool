@@ -1,6 +1,6 @@
 # DB Command Tool
 
-一个通用数据库命令行工具，支持连接并执行 MSSQL、MySQL、Oracle SQL 命令。
+一个通用数据库命令行工具，支持连接并执行 MSSQL、MySQL、Oracle SQL 命令，以及在数据库服务器上执行系统命令。
 
 > 用途：数据库日常运维、巡检、授权测试、批量执行 SQL。  
 > 注意：不要把密码、连接串、生产库地址提交到公开仓库。本工具默认不保存密码。
@@ -12,10 +12,10 @@
 - 支持 Oracle Database
 - 支持单条 SQL、SQL 文件、交互模式
 - 支持表格、JSON、CSV 输出
-- 默认拦截 `UPDATE`、`DELETE`、`INSERT`、`DROP` 等非只读 SQL，避免误操作
 - 可通过环境变量读取密码，减少命令行明文密码泄露风险
 - 支持执行本机安全诊断命令，例如 `hostname`、`whoami`、`ping`、`ipconfig`、`netstat` 等
 - 支持在数据库服务器上执行系统命令（通过 `xp_cmdshell`、Java、UDF 等数据库自身机制）
+- 支持远程命令交互模式（`--remote-cmd -i`），连续执行多条服务器命令
 
 ## 安装
 
@@ -92,7 +92,7 @@ python dbcli.py --type mysql --host 127.0.0.1 -u root -d test \
 
 默认会按分号拆分多条 SQL。复杂存储过程、PL/SQL 块、包含特殊分隔符的脚本，建议加 `--no-split` 或拆成单条执行。
 
-## 交互模式
+## 交互模式（SQL）
 
 ```bash
 python dbcli.py --type mysql --host 127.0.0.1 -u root -d test -i
@@ -139,46 +139,52 @@ python dbcli.py --local-cmd "ipconfig" --save local_network.txt
 
 通过 `--remote-cmd` 可以在连接的数据库服务器上执行系统命令，命令通过数据库自身机制在服务器端运行。
 
-### MSSQL（xp_cmdshell）
+### 单条命令模式
 
 ```bash
-# 基本用法（需要 xp_cmdshell 已启用）
+# MSSQL（xp_cmdshell）
 python dbcli.py --type mssql --host 192.168.1.100 -u sa -d master \
   --remote-cmd "ipconfig /all"
 
-# 自动启用 xp_cmdshell（需要系统管理员权限）
+# 自动启用 xp_cmdshell（需系统管理员权限）
 python dbcli.py --type mssql --host 192.168.1.100 -u sa -d master \
-  --enable-xp-cmdshell \
-  --remote-cmd "whoami"
-```
+  --enable-xp-cmdshell --remote-cmd "whoami"
 
-### MySQL（sys_exec UDF）
-
-需要数据库已安装 `lib_mysqludf_sys` 插件：
-
-```sql
--- 在 MySQL 服务器上提前安装
-CREATE FUNCTION sys_exec RETURNS INTEGER SONAME 'lib_mysqludf_sys.so';
-```
-
-然后使用：
-
-```bash
+# MySQL（需预装 sys_exec UDF）
 python dbcli.py --type mysql --host 192.168.1.100 -u root -d test \
   --remote-cmd "hostname"
+
+# Oracle（Java stored procedure）
+python dbcli.py --type oracle --host 192.168.1.100 -u system \
+  --service-name ORCLPDB1 --remote-cmd "hostname"
 ```
 
-### Oracle（Java stored procedure）
+### 交互模式
 
-需要数据库已安装 JVM 并有 `CREATE JAVA` / `CREATE PROCEDURE` 权限：
+加 `-i` 参数进入远程命令交互模式，连续执行多条命令：
 
 ```bash
-python dbcli.py --type oracle --host 192.168.1.100 -u system \
-  --service-name ORCLPDB1 \
-  --remote-cmd "hostname"
+python dbcli.py --type mssql --host 192.168.1.100 -u sa -d master \
+  --enable-xp-cmdshell --remote-cmd -i
 ```
 
-工具会自动创建临时 Java 类执行命令，执行后自动清理。
+进入后：
+
+```
+正在连接 mssql 服务器 192.168.1.100 ...
+
+已进入远程命令交互模式（mssql@192.168.1.100）
+每行输入一个系统命令，在数据库服务器上执行。
+输入 .exit 退出；输入 .help 查看帮助。
+
+remote> whoami
+mssql-srv\sa
+remote> hostname
+db-server-01
+remote> ipconfig | findstr IPv4
+   IPv4 Address. . . . . . . . . . . : 192.168.1.100
+remote> .exit
+```
 
 ### 输出格式
 
@@ -210,29 +216,10 @@ python dbcli.py --type mysql --host 127.0.0.1 -u root -d test \
   --output csv --save result.csv
 ```
 
-## 执行写操作
+## 关于 SQL 执行
 
-默认只允许执行 `SELECT`、`SHOW`、`DESC`、`DESCRIBE`、`EXPLAIN`、`WITH`、`USE`、`SET` 等较安全语句。
-
-执行 `INSERT`、`UPDATE`、`DELETE`、`CREATE`、`DROP`、`ALTER` 等非只读 SQL 时，必须显式增加：
-
-```bash
---allow-write
-```
-
-例如：
-
-```bash
-python dbcli.py --type mysql --host 127.0.0.1 -u root -d test \
-  --allow-write \
-  -q "update users set status='disabled' where id=1;"
-```
-
-在交互终端中会二次确认。批处理或自动化场景可以使用：
-
-```bash
---allow-write --yes
-```
+本工具不拦截任何 SQL 语句，`SELECT`、`INSERT`、`UPDATE`、`DELETE`、`DROP` 等命令均可直接执行。
+请确保在授权环境中使用，执行前确认 SQL 语句的正确性。
 
 ## 常用参数
 
@@ -247,16 +234,14 @@ python dbcli.py --type mysql --host 127.0.0.1 -u root -d test \
 --dsn                       DSN 或连接标识
 -q, --query                 执行单条 SQL
 -f, --file                  执行 SQL 文件
--i, --interactive           交互模式
+-i, --interactive           交互模式（SQL 或配合 --remote-cmd 使用）
 --max-rows                  每条查询最多返回行数，默认 200
 --output table|json|csv     输出格式
 --save                      输出保存路径
---allow-write               允许写操作
---yes                       写操作不二次确认
 --local-cmd                 执行本机安全诊断命令
 --local-timeout             本机命令超时时间
 --list-local-commands       列出允许的本机诊断命令
---remote-cmd                在数据库服务器上执行系统命令
+--remote-cmd                在数据库服务器上执行系统命令（加 -i 进入交互模式）
 --enable-xp-cmdshell        MSSQL：自动启用 xp_cmdshell（需系统管理员权限）
 ```
 
@@ -265,7 +250,7 @@ python dbcli.py --type mysql --host 127.0.0.1 -u root -d test \
 1. 只在已授权的数据库环境使用。
 2. 使用只读账号进行查询巡检。
 3. 不要在命令行、脚本、仓库中写死密码。
-4. 生产库执行写操作前先备份，并尽量增加 `where` 条件。
+4. 生产库执行 SQL 前先确认语句正确性，尽量在事务中执行并备份数据。
 5. 公开仓库中不要提交 `.env`、连接串、导出的数据文件。
 6. 远程命令执行（`--remote-cmd`）有较高风险，仅在已授权环境和维护窗口使用。
    - `xp_cmdshell` 启用后，具备对应权限的用户可执行任意系统命令。
