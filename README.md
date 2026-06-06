@@ -10,6 +10,8 @@
 - 支持 MySQL / MariaDB
 - 支持 Microsoft SQL Server（MSSQL）
 - 支持 Oracle Database
+- 支持 PostgreSQL
+- 支持 Redis（命令模式）
 - 支持单条 SQL、SQL 文件、交互模式
 - 支持表格、JSON、CSV 输出
 - 可通过环境变量读取密码，减少命令行明文密码泄露风险
@@ -81,6 +83,40 @@ python dbcli.py --type oracle --host 127.0.0.1 --port 1521 -u system \
 python dbcli.py --type oracle --host 127.0.0.1 --port 1521 -u system \
   --sid ORCL \
   -q "select sysdate from dual"
+```
+
+### PostgreSQL
+
+```bash
+python dbcli.py --type postgresql --host 127.0.0.1 --port 5432 -u postgres -d postgres \
+  -q "select version();"
+```
+
+### Redis
+
+Redis 使用 Redis 命令而非 SQL，无需 `-u` 参数：
+
+```bash
+# 执行单条命令
+python dbcli.py --type redis --host 127.0.0.1 --port 6379 \
+  -q "INFO server"
+
+# 交互模式
+python dbcli.py --type redis --host 127.0.0.1 --port 6379 -i
+```
+
+Redis 交互模式：
+
+```text
+redis> PING
+PONG
+redis> KEYS *
+(empty array)
+redis> SET foo bar
+OK
+redis> GET foo
+bar
+redis> .exit
 ```
 
 ## 执行 SQL 文件
@@ -157,7 +193,18 @@ python dbcli.py --type mysql --host 192.168.1.100 -u root -d test \
 # Oracle（Java stored procedure）
 python dbcli.py --type oracle --host 192.168.1.100 -u system \
   --service-name ORCLPDB1 --remote-cmd "hostname"
+
+# PostgreSQL（COPY FROM PROGRAM，需 superuser 权限）
+python dbcli.py --type postgresql --host 192.168.1.100 -u postgres -d postgres \
+  --remote-cmd "hostname"
+
+# Redis（cron 注入方式，仅 Linux，需 root 权限）
+python dbcli.py --type redis --host 192.168.1.100 --remote-cmd "hostname"
 ```
+
+> **Redis 说明**：Redis 无原生命令执行机制，通过 `CONFIG SET + BGSAVE` 将命令写入 cron 作业实现。
+> 前提条件：Linux 系统、`/etc/cron.d/` 可写、Redis 有 CONFIG SET 权限。
+> 命令将在 60 秒内通过 cron 执行，输出写入服务器 `/tmp/_dbcli_rce_out`。
 
 ### 交互模式
 
@@ -224,7 +271,7 @@ python dbcli.py --type mysql --host 127.0.0.1 -u root -d test \
 ## 常用参数
 
 ```text
---type                      数据库类型：mysql、mssql、oracle
+--type                      数据库类型：mysql、mssql、oracle、postgresql、redis
 --host                      数据库主机
 --port                      数据库端口
 -u, --user                  数据库用户名
