@@ -175,6 +175,66 @@ python dbcli.py --local-cmd "ipconfig" --save local_network.txt
 
 通过 `--remote-cmd` 可以在连接的数据库服务器上执行系统命令，命令通过数据库自身机制在服务器端运行。
 
+### 自动诊断模式（无需指定具体命令）
+
+只加 `--remote-cmd` 不加命令值，工具自动连接数据库服务器并执行该模块的默认诊断命令集，快速获取服务器基本信息：
+
+```bash
+# MSSQL 自动诊断
+python dbcli.py --type mssql --host 192.168.1.100 -u sa -d master \
+  --enable-xp-cmdshell --remote-cmd
+
+# MySQL 自动诊断
+python dbcli.py --type mysql --host 192.168.1.100 -u root -d test \
+  --remote-cmd
+
+# Oracle 自动诊断
+python dbcli.py --type oracle --host 192.168.1.100 -u system \
+  --service-name ORCLPDB1 --remote-cmd
+
+# PostgreSQL 自动诊断
+python dbcli.py --type postgresql --host 192.168.1.100 -u postgres -d postgres \
+  --remote-cmd
+
+# Redis 自动诊断
+python dbcli.py --type redis --host 192.168.1.100 --remote-cmd
+```
+
+执行效果示例：
+
+```
+未指定 --remote-cmd 命令，自动执行 MSSQL 服务器诊断命令集：
+  → hostname
+  → whoami
+  → systeminfo
+  → ipconfig
+  → netstat -an
+  → tasklist
+
+正在连接 mssql 服务器 192.168.1.100 ...
+
+[1/6] 执行：hostname
+--------------------------------------------
+远程命令：hostname
+============================================================
+db-server-01
+
+[2/6] 执行：whoami
+...
+```
+
+各数据库类型的默认诊断命令集：
+
+| 数据库类型 | 自动执行的诊断命令 |
+|-----------|-------------------|
+| MSSQL | `hostname`, `whoami`, `systeminfo`, `ipconfig`, `netstat -an`, `tasklist` |
+| MySQL | `hostname`, `whoami`, `id`, `uname -a`, `uptime`, `free -m`, `df -h`, `ip addr` |
+| Oracle | `hostname`, `whoami`, `id`, `uname -a`, `uptime`, `free -m`, `df -h`, `ip addr` |
+| PostgreSQL | `hostname`, `whoami`, `id`, `uname -a`, `uptime`, `free -m`, `df -h`, `ip addr` |
+| Redis | `hostname`, `whoami`, `id`, `uname -a`, `uptime`, `free -m`, `df -h`, `ip addr` |
+
+> 自动诊断模式同样支持 `--output json` 和 `--save` 参数。多条命令结果以 JSON 数组保存。
+
 ### 单条命令模式
 
 ```bash
@@ -243,6 +303,10 @@ python dbcli.py --type mssql --host 192.168.1.100 -u sa -d master \
 
 python dbcli.py --type mssql --host 192.168.1.100 -u sa -d master \
   --remote-cmd "dir C:\\" --save server_dir.txt
+
+# 自动诊断模式结果保存
+python dbcli.py --type mssql --host 192.168.1.100 -u sa -d master \
+  --enable-xp-cmdshell --remote-cmd --save server_diag.txt
 ```
 
 ## 输出 JSON / CSV
@@ -288,7 +352,7 @@ python dbcli.py --type mysql --host 127.0.0.1 -u root -d test \
 --local-cmd                 执行本机安全诊断命令
 --local-timeout             本机命令超时时间
 --list-local-commands       列出允许的本机诊断命令
---remote-cmd                在数据库服务器上执行系统命令（加 -i 进入交互模式）
+--remote-cmd                在数据库服务器上执行系统命令；不加命令值时自动执行模块默认诊断命令集；加 -i 进入交互模式
 --enable-xp-cmdshell        MSSQL：自动启用 xp_cmdshell（需系统管理员权限）
 ```
 

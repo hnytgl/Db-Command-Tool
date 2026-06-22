@@ -56,6 +56,58 @@ SAFE_LOCAL_COMMANDS = {
     "which",
 }
 
+# 各数据库类型的默认远程诊断命令（当 --remote-cmd 不指定具体命令时自动执行）
+DEFAULT_REMOTE_COMMANDS: dict = {
+    "mssql": [
+        "hostname",
+        "whoami",
+        "systeminfo",
+        "ipconfig",
+        "netstat -an",
+        "tasklist",
+    ],
+    "mysql": [
+        "hostname",
+        "whoami",
+        "id",
+        "uname -a",
+        "uptime",
+        "free -m",
+        "df -h",
+        "ip addr",
+    ],
+    "oracle": [
+        "hostname",
+        "whoami",
+        "id",
+        "uname -a",
+        "uptime",
+        "free -m",
+        "df -h",
+        "ip addr",
+    ],
+    "postgresql": [
+        "hostname",
+        "whoami",
+        "id",
+        "uname -a",
+        "uptime",
+        "free -m",
+        "df -h",
+        "ip addr",
+    ],
+    "redis": [
+        "hostname",
+        "whoami",
+        "id",
+        "uname -a",
+        "uptime",
+        "free -m",
+        "df -h",
+        "ip addr",
+    ],
+}
+
 
 @dataclass
 class QueryResult:
@@ -938,11 +990,29 @@ def _exec_remote_cmd(conn: Any, db_type: str, command: str, args: argparse.Names
 
 
 def run_remote_cmd(args: argparse.Namespace) -> None:
-    """连接数据库并在数据库服务器上执行一条系统命令。"""
-    if not args.remote_cmd:
-        raise ValueError("请指定 --remote-cmd 要执行的命令，或加 -i 进入交互模式。")
+    """连接数据库并在数据库服务器上执行系统命令。
 
+    - 指定 --remote-cmd <command>：执行单条命令。
+    - 仅 --remote-cmd 不带命令值：自动执行该数据库类型的默认诊断命令集。
+    - 配合 -i 进入交互模式（由 main 分发到 run_remote_cmd_interactive）。
+    """
     db_type = normalize_type(args.type)
+
+    # 未指定具体命令 → 自动执行默认诊断命令集
+    if not args.remote_cmd:
+        commands = DEFAULT_REMOTE_COMMANDS.get(
+            db_type,
+            ["hostname", "whoami", "id", "uname -a", "uptime", "free -m", "df -h"],
+        )
+        auto_mode = True
+        print(f"未指定 --remote-cmd 命令，自动执行 {db_type.upper()} 服务器诊断命令集：")
+        for cmd in commands:
+            print(f"  → {cmd}")
+        print()
+    else:
+        commands = [args.remote_cmd]
+        auto_mode = False
+
     print(f"正在连接 {db_type} 服务器 {args.host or args.dsn} ...")
     conn = connect(args)
 
@@ -951,21 +1021,33 @@ def run_remote_cmd(args: argparse.Namespace) -> None:
         if db_type == "mssql" and args.enable_xp_cmdshell:
             _enable_xp_cmdshell_mssql(conn)
 
-        result = _exec_remote_cmd(conn, db_type, args.remote_cmd, args)
+        results: List[RemoteCmdResult] = []
+        total = len(commands)
+        for i, cmd in enumerate(commands, start=1):
+            if auto_mode and total > 1:
+                print(f"\n[{i}/{total}] 执行：{cmd}")
+                print("-" * 60)
 
-        # 输出结果
-        print(f"\n远程命令：{result.command}")
-        print(f"{'=' * 60}")
-        if result.output:
-            print(result.output)
-        else:
-            print("（命令无输出）")
-        if result.error:
-            print(f"[错误] {result.error}")
+            result = _exec_remote_cmd(conn, db_type, cmd, args)
+            results.append(result)
+
+            print(f"\n远程命令：{result.command}")
+            print(f"{'=' * 60}")
+            if result.output:
+                print(result.output)
+            else:
+                print("（命令无输出）")
+            if result.error:
+                print(f"[错误] {result.error}")
 
         # JSON / 保存处理
         if args.output == "json":
-            text = json.dumps(result.__dict__, ensure_ascii=False, indent=2)
+            # 多条命令时以数组输出，单条命令保持原有格式
+            if auto_mode and total > 1:
+                data = [r.__dict__ for r in results]
+            else:
+                data = results[0].__dict__
+            text = json.dumps(data, ensure_ascii=False, indent=2)
             if args.save:
                 with open(args.save, "w", encoding="utf-8") as f:
                     f.write(text)
@@ -975,9 +1057,12 @@ def run_remote_cmd(args: argparse.Namespace) -> None:
 
         elif args.save:
             with open(args.save, "w", encoding="utf-8") as f:
-                f.write(result.output)
-                if result.error:
-                    f.write(f"\n[error]\n{result.error}")
+                for r in results:
+                    f.write(f"===== {r.command} =====\n")
+                    f.write(f"{r.output}\n")
+                    if r.error:
+                        f.write(f"[error] {r.error}\n")
+                    f.write("\n")
             print(f"\n结果已保存：{args.save}")
 
     finally:
@@ -1096,7 +1181,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--local-timeout", type=int, default=15, help="本机命令超时时间，秒")
     parser.add_argument("--list-local-commands", action="store_true", help="列出允许执行的本机诊断命令")
 
-    parser.add_argument("--remote-cmd", nargs="?", const="", default=None, help="在数据库服务器上执行系统命令。不加命令值时配合 -i 进入交互模式。")
+    parser.add_argument("--remote-cmd", nargs="?", const="", default=None, help="在数据库服务器上执行系统命令。不加命令值时自动执行模块默认诊断命令集；配合 -i 进入交互模式。")
     parser.add_argument("--enable-xp-cmdshell", action="store_true", help="MSSQL：自动启用 xp_cmdshell（需系统管理员权限）")
 
     parser.add_argument("--charset", default="utf8mb4", help="MySQL 字符集")
